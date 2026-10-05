@@ -1,3 +1,46 @@
+﻿<#
+
+.SYNOPSIS
+PSAppDeployToolkit 4.1.8 - job template: install, uninstall or repair one application.
+
+.DESCRIPTION
+Based on the PSAppDeployToolkit 4.1.8 template (Initialization and Invocation unchanged, so a toolkit update stays a file swap).
+Additions, all driven by the variables in $adtSession:
+- Installs the MSI or EXE from .\Files (MSI: properties are added to the PSADT defaults, transforms optional).
+- Checks the application before the install (skips when it is already there) and verifies it afterwards.
+- Writes an inventory record to the registry on install and updates it on uninstall.
+- Uninstalls by product code, by an own uninstaller or by the exact name in Programs and Features.
+
+.PARAMETER DeploymentType
+The type of deployment to perform.
+
+.PARAMETER DeployMode
+Specifies whether the installation should be run in Interactive (shows dialogs), Silent (no dialogs), NonInteractive (dialogs without prompts) mode, or Auto (shows dialogs if a user is logged on, device is not in the OOBE, and there's no running apps to close).
+
+.PARAMETER SuppressRebootPassThru
+Suppresses the 3010 return code (requires restart) from being passed back to the parent process (e.g. SCCM) if detected from an installation.
+
+.PARAMETER TerminalServerMode
+Changes to "user install mode" and back to "user execute mode" for installing/uninstalling applications for Remote Desktop Session Hosts/Citrix servers.
+
+.PARAMETER DisableLogging
+Disables logging to file for the script.
+
+.EXAMPLE
+Invoke-AppDeployToolkit.exe -DeploymentType Install -DeployMode Silent
+
+.NOTES
+Exit codes of this template (PSADT recommends 69000 - 69999 for codes of Invoke-AppDeployToolkit.ps1):
+- 69001: The application was not found after the installation (verification failed).
+- 69002: The application check itself failed (see the log).
+- 69003: Management Point routing: no Management Point found in the registry.
+Register them as failure codes in Configuration Manager and Intune.
+
+.LINK
+https://psappdeploytoolkit.com
+
+#>
+
 [CmdletBinding()]
 param
 (
@@ -28,270 +71,292 @@ param
 
 $adtSession = @{
     # App variables.
-    AppName    = ''
-    AppVendor  = ''
+    AppVendor = ''
+    AppName = ''
     AppVersion = ''
-
-    # Use if the AppName or AppVendor deviate from the standard display name
-    appNameControlPanel   = ''     # Set if display name in Control Panel differs from AppName
-    appVendorControlPanel = ''     # Set if publisher in Control Panel differs from AppVendor
-
-    AppArch             = 'x64'
-    AppLang             = 'MUI'
-    AppRevision         = '01'
+    AppArch = 'x64'
+    AppLang = 'MUI'
+    AppRevision = '01'
     AppSuccessExitCodes = @(0)
-    AppRebootExitCodes  = @(1641, 3010)
-    AppProcessesToClose = @()      # Example: @('excel', @{ Name = 'winword'; Description = 'Microsoft Word' })
-    AppScriptVersion    = '1.0.0'
-    AppScriptDate       = (Get-Date -Format 'yyyy-MM-dd')
-    AppScriptAuthor     = ''       # Packager name or team
-    RequireAdmin        = $true
+    AppRebootExitCodes = @(1641, 3010)
+    AppProcessesToClose = @()  # Example: @('excel', @{ Name = 'winword'; Description = 'Microsoft Word' })
+    AppScriptVersion = '1.0.0'
+    AppScriptDate = '2026-10-05'
+    AppScriptAuthor = ''       # Packager name or team
+    RequireAdmin = $true
 
-    # Install Titles (only set to override toolkit defaults)
-    InstallName  = ''
+    # Install Titles (Only set here to override defaults set by the toolkit).
+    # InstallName defaults to Vendor_Name_Version_Arch_Lang_Revision; it is also the inventory key.
+    InstallName = ''
     InstallTitle = ''
 
-    # Script variables
+    # Script variables.
     DeployAppScriptFriendlyName = $MyInvocation.MyCommand.Name
-    DeployAppScriptParameters   = $PSBoundParameters
-    DeployAppScriptVersion      = '4.1.7'
+    DeployAppScriptParameters = $PSBoundParameters
+    DeployAppScriptVersion = '4.1.8'
 
     ##================================================
-    ## MARK: Package Configuration
+    ## MARK: Package configuration
+    ## Own keys: PSADT 4.1 adds them to the session as properties. Empty values are dropped by
+    ## Remove-ADTHashtableNullOrEmptyValues, so every function reads them through Get-PackageValue.
     ##================================================
 
-    PSADTAppID   = 'APP000001'           # APP + 6-digit consecutive number
-    ProcessToStop = @{ Name = 'null' }   # Process to close before install. Example: @{ Name = 'winword' }
+    PSADTAppID = 'APP000001'               # APP + 6-digit consecutive number
+
+    # Name in Programs and Features, when it differs from AppName / AppVendor.
+    # Used for the check and for the uninstall by name (exact match).
+    appNameControlPanel = ''
+    appVendorControlPanel = ''
 
     # --- Installation ---
-    StandardInstall        = $true       # $false = use Management Point-aware routing
-    installFileName        = ''          # .msi or .exe filename from .\Files\ folder
-    customInstallParameter = ''          # e.g. '/qn /norestart REBOOT=ReallySuppress' or '/s'
-    transforms             = ''          # MST transform filename (optional)
-    ignoreExitCodes        = ''          # Comma-separated exit codes to treat as success (EXE only)
+    StandardInstall = $true                # $false = Management Point routing (see Install-ADTDeployment)
+    installFileName = ''                   # .msi or .exe in .\Files
+    msiProperties = ''                     # MSI only: 'ALLUSERS=1 INSTALLDIR="C:\Program Files\App"', added to the PSADT defaults
+    customInstallParameter = ''            # EXE: silent switches ('/S'). MSI: REPLACES the PSADT defaults (/QN REBOOT=ReallySuppress, logging) - normally leave empty
+    transforms = ''                        # MST file(s) in .\Files, comma separated, applied in this order
+    ignoreExitCodes = ''                   # Exit codes to treat as success, comma separated (e.g. '1603,1618'), MSI and EXE
 
-    # --- Application Verification (Check-Application) ---
-    # All checks are optional. Enable only what applies to this package.
-    CheckAppbyDefault     = $true        # Run verification before and after install
-    mainExecutablePath    = ''           # Full path to main EXE: 'C:\Program Files\Vendor\app.exe'
-    appVersionCheck       = ''           # Expected version string, e.g. '1.0.0.123'
-    useFileVersion        = $true        # $true = FileVersion, $false = ProductVersion
-
-    # Registry check (optional)
-    checkRegistryHive      = 'HKLM'     # HKLM or HKCU
-    checkRegistryKey       = ''          # e.g. 'Software\Vendor\AppName'
-    checkRegistryValueName = ''          # Registry value name to check
-    checkRegistryValueData = ''          # Expected value data
-
-    # MSI GUID check (optional, MSI packages only)
-    CheckMSIGuid = ''                    # e.g. '{90160000-000F-0000-1000-0000000FF1CE}'
+    # --- Application check (Test-ApplicationState) ---
+    CheckAppbyDefault = $true              # Check before the install (skip when present) and verify afterwards
+    CheckMSIGuid = ''                      # MSI product code: strongest check, also used for uninstall and repair
+    mainExecutablePath = ''                # 'C:\Program Files\Vendor\App\app.exe'
+    appVersionCheck = ''                   # Minimum version of mainExecutablePath, e.g. '1.0.0.123'
+    useFileVersion = $true                 # $true = file version, $false = product version
+    checkRegistryHive = 'HKLM'             # HKLM or HKCU
+    checkRegistryKey = ''                  # 'SOFTWARE\Vendor\App'
+    checkRegistryValueName = ''
+    checkRegistryValueData = ''
 
     # --- Uninstallation ---
-    unInstallFileName        = ''        # Leave empty for auto-detect. Set to EXE path for custom uninstallers.
-    customUninstallParameter = ''        # Uninstall silent switch, e.g. '/quiet' or '/S'
+    unInstallFileName = ''                 # Own uninstaller: full path, or relative to .\Files
+    customUninstallParameter = ''          # Its silent switch, e.g. '/S'
+
+    # --- Completion ---
+    ShowCompletionPrompt = $true           # PSADT shows no prompt in silent mode anyway
 }
 
-##================================================
-## Global Variables
-##================================================
-[string]$global:CompanyName      = 'Company' # <---- Change to your Company
-[string]$global:DeployInvRegPath = "HKEY_LOCAL_MACHINE\Software\$CompanyName\Deployment"
-$global:PSADTPackageName         = "$($adtSession.AppVendor)_$($adtSession.AppName)_$($adtSession.AppVersion)_$($adtSession.AppArch)_$($adtSession.AppLang)_$($adtSession.AppRevision)"
-$global:CompDomain               = (Get-WmiObject Win32_ComputerSystem).Domain
+# Inventory root in the registry (one key per package, named after InstallName).
+[System.String]$script:CompanyName = 'Company'  # <---- Change to your company
+[System.String]$script:DeployInvRegPath = "HKLM\SOFTWARE\$script:CompanyName\Deployment"
+
 
 ##================================================
 ## MARK: Install
 ##================================================
+
 function Install-ADTDeployment
 {
     [CmdletBinding()]
-    param()
+    param
+    (
+    )
 
-    ##--------------------------------------------
-    ## Pre-Install
-    ##--------------------------------------------
+    ##================================================
+    ## MARK: Pre-Install
+    ##================================================
     $adtSession.InstallPhase = "Pre-$($adtSession.DeploymentType)"
-    Set-DeploymentInventoryRegPath
-    Show-ADTInstallationWelcome -CheckDiskSpace
-    Show-ADTInstallationWelcome -CloseProcesses $($adtSession.ProcessToStop) -Silent
 
-    # Application state check
-    if ($adtSession.CheckAppbyDefault) {
-        Write-ADTLogEntry -Message "Checking application state before installation..." -Severity 1
-        $checkApplicationResult = Check-Application
+    ## Close the configured processes silently and check the free disk space.
+    $saiwParams = @{ CheckDiskSpace = $true; Silent = $true }
+    if ($adtSession.AppProcessesToClose.Count -gt 0)
+    {
+        $saiwParams.Add('CloseProcesses', $adtSession.AppProcessesToClose)
+    }
+    Show-ADTInstallationWelcome @saiwParams
 
-        if ($checkApplicationResult -eq 'Error') {
-            Write-ADTLogEntry -Message "Pre-install check failed with error. Aborting." -Severity 3
-            Close-ADTSession -ExitCode 70002
-            return
+    ## Check the application before the install.
+    $checkBefore = 'NotInstalled'
+    if (Get-PackageValue 'CheckAppbyDefault' $true)
+    {
+        Write-ADTLogEntry -Message 'Checking the application before the installation.'
+        $checkBefore = Test-ApplicationState
+        if ($checkBefore -eq 'Error')
+        {
+            Write-ADTLogEntry -Message 'The check before the installation failed; the installation stops.' -Severity 3
+            Close-ADTSession -ExitCode 69002   # ends the deployment here
         }
     }
-    else {
-        Write-ADTLogEntry -Message "Application check skipped (CheckAppbyDefault = false)" -Severity 1
-        $checkApplicationResult = 'NotInstalled'
-    }
 
-    ## <Add Pre-Installation tasks here>
+    ## <Perform Pre-Installation tasks here>
 
-    ##--------------------------------------------
-    ## Install
-    ##--------------------------------------------
+
+    ##================================================
+    ## MARK: Install
+    ##================================================
     $adtSession.InstallPhase = $adtSession.DeploymentType
-    Show-ADTInstallationProgress -WindowTitle "$($adtSession.AppVendor) · $($adtSession.AppName) · $($adtSession.AppVersion)"
+    Show-ADTInstallationProgress -Title "$($adtSession.AppVendor) · $($adtSession.AppName) · $($adtSession.AppVersion)"
 
-    if ($adtSession.StandardInstall) {
-        # Standard installation (auto-routing based on file extension)
-        if ($checkApplicationResult -eq 'NotInstalled') {
-            Write-ADTLogEntry -Message "Starting standard installation..." -Severity 1
-            Install-Application
-        }
-        else {
-            Write-ADTLogEntry -Message "Application already installed. Skipping." -Severity 1
-        }
+    if ($checkBefore -eq 'Installed')
+    {
+        Write-ADTLogEntry -Message "$($adtSession.AppName) $($adtSession.AppVersion) is already installed; the installation is skipped."
     }
-    else {
-        # Management Point-aware installation
-        # Use when installation behavior differs per SCCM site
-        if ($checkApplicationResult -eq 'NotInstalled') {
-            Write-ADTLogEntry -Message "Starting MP-aware installation..." -Severity 1
-
-            $SMSDPMP = Get-ADTRegistryKey -Key 'HKLM:SOFTWARE\Microsoft\SMS\DP' -Name 'ManagementPoints'
-
-            if ([string]::IsNullOrWhiteSpace($SMSDPMP)) {
-                Write-ADTLogEntry -Message "No Management Point found in registry. Cannot continue." -Severity 3
-                Close-ADTSession -ExitCode 70003
-                return
-            }
-
-            Write-ADTLogEntry -Message "Management Point detected: $SMSDPMP"
-
-            switch ($SMSDPMP) {
-                "SiteServer-HQ" {
-                    Write-ADTLogEntry -Message "Using HQ site server: $SMSDPMP"
-                    # Add HQ-specific install actions here
-                }
-                "SiteServer-North" {
-                    Write-ADTLogEntry -Message "Using North site server: $SMSDPMP"
-                    # Add regional install actions here
-                }
-                "SiteServer-South" {
-                    Write-ADTLogEntry -Message "Using South site server: $SMSDPMP"
-                    # Add regional install actions here
-                }
-                default {
-                    Write-ADTLogEntry -Message "Unknown Management Point: $SMSDPMP" -Severity 2
-                }
-            }
+    elseif (Get-PackageValue 'StandardInstall' $true)
+    {
+        Install-Application
+    }
+    else
+    {
+        ## Management Point routing: when the installation differs per Configuration Manager site.
+        $managementPoint = @(Get-ADTRegistryKey -LiteralPath 'HKLM\SOFTWARE\Microsoft\SMS\DP' -Name 'ManagementPoints') -join ', '
+        if ([System.String]::IsNullOrWhiteSpace($managementPoint))
+        {
+            Write-ADTLogEntry -Message 'No Management Point found in the registry; the installation stops.' -Severity 3
+            Close-ADTSession -ExitCode 69003
         }
-        else {
-            Write-ADTLogEntry -Message "Application already installed. Skipping." -Severity 1
+        Write-ADTLogEntry -Message "Management Point: $managementPoint"
+        switch -Wildcard ($managementPoint)
+        {
+            '*SiteServer-HQ*'
+            {
+                # HQ-specific installation
+                Install-Application
+            }
+            '*SiteServer-North*'
+            {
+                # Regional installation
+                Install-Application
+            }
+            default
+            {
+                Write-ADTLogEntry -Message "No routing for Management Point $managementPoint; the standard installation runs." -Severity 2
+                Install-Application
+            }
         }
     }
 
-    ## <Add Post-Installation tasks here>
+    ## <Perform Installation tasks here>
 
-    ##--------------------------------------------
-    ## Post-Install — Verification
-    ##--------------------------------------------
+
+    ##================================================
+    ## MARK: Post-Install
+    ##================================================
     $adtSession.InstallPhase = "Post-$($adtSession.DeploymentType)"
 
-    if ($adtSession.CheckAppbyDefault) {
-        Write-ADTLogEntry -Message "Verifying installation..." -Severity 1
-        $verifyResult = Check-Application
+    ## <Perform Post-Installation tasks here>
 
-        switch ($verifyResult) {
-            'Installed' {
-                Write-ADTLogEntry -Message "Installation verified successfully." -Severity 1
-                Register-AppInstallation
-                Register-SuccessOfAppInstallation
-                Write-ADTLogEntry -Message "$($adtSession.AppVendor) $($adtSession.AppName) $($adtSession.AppVersion) — installed." -Severity 1
-                Show-ADTInstallationPrompt -Title "$($adtSession.AppVendor) · $($adtSession.AppName) · $($adtSession.AppVersion)" -Message 'Installation complete.' -ButtonRightText 'OK' -NoWait -Timeout 5
+    ## Verify the installation, then write the inventory record.
+    if (Get-PackageValue 'CheckAppbyDefault' $true)
+    {
+        Write-ADTLogEntry -Message 'Verifying the installation.'
+        switch (Test-ApplicationState)
+        {
+            'Installed'
+            {
+                Write-ADTLogEntry -Message 'The installation is verified.'
             }
-            'NotInstalled' {
-                Write-ADTLogEntry -Message "Post-install verification failed — application not found." -Severity 3
-                Close-ADTSession -ExitCode 70001
+            'NotInstalled'
+            {
+                Write-ADTLogEntry -Message 'The application was not found after the installation.' -Severity 3
+                Close-ADTSession -ExitCode 69001
             }
-            'Error' {
-                Write-ADTLogEntry -Message "Post-install verification check threw an error." -Severity 3
-                Close-ADTSession -ExitCode 70002
+            default
+            {
+                Write-ADTLogEntry -Message 'The verification after the installation failed.' -Severity 3
+                Close-ADTSession -ExitCode 69002
             }
         }
     }
-    else {
-        Write-ADTLogEntry -Message "Application check skipped (CheckAppbyDefault = false)" -Severity 1
-        Register-AppInstallation
-        Register-SuccessOfAppInstallation
-        Write-ADTLogEntry -Message "Installation completed." -Severity 1
+    Register-AppInstallation
+
+    if (Get-PackageValue 'ShowCompletionPrompt' $true)
+    {
         Show-ADTInstallationPrompt -Title "$($adtSession.AppVendor) · $($adtSession.AppName) · $($adtSession.AppVersion)" -Message 'Installation complete.' -ButtonRightText 'OK' -NoWait -Timeout 5
     }
 }
 
-##================================================
-## MARK: Uninstall
-##================================================
 function Uninstall-ADTDeployment
 {
     [CmdletBinding()]
-    param()
+    param
+    (
+    )
 
-    ##--------------------------------------------
-    ## Pre-Uninstall
-    ##--------------------------------------------
+    ##================================================
+    ## MARK: Pre-Uninstall
+    ##================================================
     $adtSession.InstallPhase = "Pre-$($adtSession.DeploymentType)"
-    Show-ADTInstallationWelcome -CloseProcesses $($adtSession.ProcessToStop) -Silent
 
-    ## <Add Pre-Uninstallation tasks here>
+    if ($adtSession.AppProcessesToClose.Count -gt 0)
+    {
+        Show-ADTInstallationWelcome -CloseProcesses $adtSession.AppProcessesToClose -Silent
+    }
 
-    ##--------------------------------------------
-    ## Uninstall
-    ##--------------------------------------------
+    ## <Perform Pre-Uninstallation tasks here>
+
+
+    ##================================================
+    ## MARK: Uninstall
+    ##================================================
     $adtSession.InstallPhase = $adtSession.DeploymentType
-    Show-ADTInstallationProgress -WindowTitle "$($adtSession.AppVendor) · $($adtSession.AppName) · $($adtSession.AppVersion)"
+    Show-ADTInstallationProgress -Title "$($adtSession.AppVendor) · $($adtSession.AppName) · $($adtSession.AppVersion)"
 
     Uninstall-Application
 
-    ##--------------------------------------------
-    ## Post-Uninstall
-    ##--------------------------------------------
-    $adtSession.InstallPhase = "Post-$($adtSession.DeploymentType)"
-    Unregister-Installation
-    Show-ADTInstallationPrompt -Title "$($adtSession.AppVendor) · $($adtSession.AppName) · $($adtSession.AppVersion)" -Message 'Uninstall complete.' -ButtonRightText 'OK' -NoWait -Timeout 5
+    ## <Perform Uninstallation tasks here>
 
-    ## <Add Post-Uninstallation tasks here>
+
+    ##================================================
+    ## MARK: Post-Uninstallation
+    ##================================================
+    $adtSession.InstallPhase = "Post-$($adtSession.DeploymentType)"
+
+    ## <Perform Post-Uninstallation tasks here>
+
+    Unregister-Installation
+
+    if (Get-PackageValue 'ShowCompletionPrompt' $true)
+    {
+        Show-ADTInstallationPrompt -Title "$($adtSession.AppVendor) · $($adtSession.AppName) · $($adtSession.AppVersion)" -Message 'Uninstall complete.' -ButtonRightText 'OK' -NoWait -Timeout 5
+    }
 }
 
-##================================================
-## MARK: Repair
-##================================================
 function Repair-ADTDeployment
 {
     [CmdletBinding()]
-    param()
+    param
+    (
+    )
 
-    ##--------------------------------------------
-    ## Pre-Repair
-    ##--------------------------------------------
+    ##================================================
+    ## MARK: Pre-Repair
+    ##================================================
     $adtSession.InstallPhase = "Pre-$($adtSession.DeploymentType)"
-    Show-ADTInstallationWelcome -CloseProcesses $($adtSession.ProcessToStop) -Silent
 
-    ## <Add Pre-Repair tasks here>
+    if ($adtSession.AppProcessesToClose.Count -gt 0)
+    {
+        Show-ADTInstallationWelcome -CloseProcesses $adtSession.AppProcessesToClose -Silent
+    }
 
-    ##--------------------------------------------
-    ## Repair
-    ##--------------------------------------------
+    ## <Perform Pre-Repair tasks here>
+
+
+    ##================================================
+    ## MARK: Repair
+    ##================================================
     $adtSession.InstallPhase = $adtSession.DeploymentType
-    Show-ADTInstallationProgress -WindowTitle "$($adtSession.AppVendor) · $($adtSession.AppName) · $($adtSession.AppVersion)"
+    Show-ADTInstallationProgress -Title "$($adtSession.AppVendor) · $($adtSession.AppName) · $($adtSession.AppVersion)"
 
-    ## <Add Repair tasks here>
+    ## MSI: repair by product code, else from the MSI in .\Files. EXE: add the repair call here.
+    $productCode = Get-PackageValue 'CheckMSIGuid'
+    $installFile = Get-PackageValue 'installFileName'
+    if ($productCode)
+    {
+        Start-ADTMsiProcess -Action Repair -ProductCode $productCode
+    }
+    elseif ($installFile -and $installFile.EndsWith('.msi', [System.StringComparison]::OrdinalIgnoreCase))
+    {
+        Start-ADTMsiProcess -Action Repair -FilePath (Join-Path -Path $adtSession.DirFiles -ChildPath $installFile)
+    }
 
-    ##--------------------------------------------
-    ## Post-Repair
-    ##--------------------------------------------
+    ## <Perform Repair tasks here>
+
+
+    ##================================================
+    ## MARK: Post-Repair
+    ##================================================
     $adtSession.InstallPhase = "Post-$($adtSession.DeploymentType)"
 
-    ## <Add Post-Repair tasks here>
-
-    Show-ADTInstallationPrompt -Title "$($adtSession.AppVendor) · $($adtSession.AppName) · $($adtSession.AppVersion)" -Message 'Repair complete.' -ButtonRightText 'OK' -NoWait -Timeout 5
+    ## <Perform Post-Repair tasks here>
 }
 
 
@@ -299,368 +364,374 @@ function Repair-ADTDeployment
 ## MARK: Functions
 ##================================================
 
-##------------------------------------------------
-## Install-Application
-## Auto-detects .msi or .exe and routes accordingly
-##------------------------------------------------
-Function Install-Application {
+function Get-PackageValue
+{
+    <#
+    .SYNOPSIS
+        A package configuration value, or the default when it is not set (empty values are not in the session).
+    #>
     [CmdletBinding()]
-    param()
+    param
+    (
+        [Parameter(Mandatory = $true, Position = 0)]
+        [System.String]$Name,
 
-    try {
-        Write-ADTLogEntry -Message "Source folder: $($adtSession.DirFiles)"
-        Write-ADTLogEntry -Message "Install file: $($adtSession.installFileName)"
+        [Parameter(Mandatory = $false, Position = 1)]
+        [System.Object]$Default = $null
+    )
 
-        $installFilePath = Join-Path -Path $adtSession.DirFiles -ChildPath $adtSession.installFileName
-        Write-ADTLogEntry -Message "Full path: $installFilePath"
-
-        if (-not (Test-Path -Path $installFilePath)) {
-            Write-ADTLogEntry -Message "Installation file not found: $installFilePath" -Severity 3
-            throw "Installation file not found: $installFilePath"
-        }
-
-        $fileExtension = (Get-Item $installFilePath).Extension.ToLower()
-        Write-ADTLogEntry -Message "Detected file type: $fileExtension"
-
-        switch ($fileExtension) {
-            '.msi' {
-                $splatParams = @{ Action = 'Install'; FilePath = $installFilePath }
-
-                if (-not [string]::IsNullOrWhiteSpace($adtSession.transforms)) {
-                    $mstFilePath = Join-Path -Path $adtSession.DirFiles -ChildPath $adtSession.transforms
-                    if (Test-Path -Path $mstFilePath) {
-                        $splatParams['Transforms'] = $mstFilePath
-                        Write-ADTLogEntry -Message "Applying MST transform: $($adtSession.transforms)"
-                    }
-                    else {
-                        Write-ADTLogEntry -Message "Transform file not found: $mstFilePath" -Severity 2
-                    }
-                }
-
-                if (-not [string]::IsNullOrWhiteSpace($adtSession.customInstallParameter)) {
-                    $splatParams['ArgumentList'] = $adtSession.customInstallParameter
-                    Write-ADTLogEntry -Message "Custom parameters: $($adtSession.customInstallParameter)"
-                }
-
-                Write-ADTLogEntry -Message "Installing (MSI): $($adtSession.AppName)"
-                Start-ADTMsiProcess @splatParams
-            }
-
-            '.exe' {
-                $splatParams = @{ FilePath = $installFilePath }
-
-                if (-not [string]::IsNullOrWhiteSpace($adtSession.customInstallParameter)) {
-                    $splatParams['ArgumentList'] = $adtSession.customInstallParameter
-                    Write-ADTLogEntry -Message "Custom parameters: $($adtSession.customInstallParameter)"
-                }
-
-                if (-not [string]::IsNullOrWhiteSpace($adtSession.ignoreExitCodes)) {
-                    $splatParams['IgnoreExitCodes'] = $adtSession.ignoreExitCodes
-                    Write-ADTLogEntry -Message "Ignoring exit codes: $($adtSession.ignoreExitCodes)"
-                }
-
-                Write-ADTLogEntry -Message "Installing (EXE): $($adtSession.AppName)"
-                Start-ADTProcess @splatParams
-            }
-
-            default {
-                Write-ADTLogEntry -Message "Unsupported file extension: $fileExtension" -Severity 3
-                throw "Unsupported file extension: $fileExtension. Supported: .msi, .exe"
-            }
-        }
-
-        Write-ADTLogEntry -Message "$($adtSession.AppName) installation completed." -Severity 1
+    $property = $adtSession.PSObject.Properties[$Name]
+    if ($null -eq $property -or [System.String]::IsNullOrWhiteSpace([System.String]$property.Value))
+    {
+        return $Default
     }
-    catch {
-        Write-ADTLogEntry -Message "Install-Application failed: $($_.Exception.Message)" -Severity 3
-        throw
+    return $property.Value
+}
+
+function Get-ListValue
+{
+    <#
+    .SYNOPSIS
+        A comma separated package value as a list ('a.mst, b.mst' -> 'a.mst', 'b.mst').
+    #>
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true, Position = 0)]
+        [System.String]$Name
+    )
+
+    return @(([System.String](Get-PackageValue $Name '')).Split(',', [System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+function Install-Application
+{
+    <#
+    .SYNOPSIS
+        Installs the MSI or EXE from .\Files.
+    #>
+    [CmdletBinding()]
+    param
+    (
+    )
+
+    $installFile = Get-PackageValue 'installFileName'
+    if (!$installFile)
+    {
+        throw 'installFileName is empty: set the setup file from .\Files.'
+    }
+    $installFilePath = Join-Path -Path $adtSession.DirFiles -ChildPath $installFile
+    if (!(Test-Path -LiteralPath $installFilePath -PathType Leaf))
+    {
+        throw "The setup file was not found: $installFilePath"
+    }
+
+    $ignoreExitCodes = Get-ListValue 'ignoreExitCodes'
+    $arguments = Get-PackageValue 'customInstallParameter'
+    switch ([System.IO.Path]::GetExtension($installFilePath).ToLowerInvariant())
+    {
+        '.msi'
+        {
+            $params = @{ Action = 'Install'; FilePath = $installFilePath }
+            $transforms = @(Get-ListValue 'transforms' | ForEach-Object { Join-Path -Path $adtSession.DirFiles -ChildPath $_ })
+            foreach ($transform in $transforms)
+            {
+                if (!(Test-Path -LiteralPath $transform -PathType Leaf))
+                {
+                    throw "The transform was not found: $transform"
+                }
+            }
+            if ($transforms.Count -gt 0)
+            {
+                $params.Add('Transforms', $transforms)
+            }
+            if ($properties = Get-PackageValue 'msiProperties')
+            {
+                $params.Add('AdditionalArgumentList', $properties)
+            }
+            if ($arguments)
+            {
+                Write-ADTLogEntry -Message "customInstallParameter replaces the PSADT MSI defaults: $arguments" -Severity 2
+                $params.Add('ArgumentList', $arguments)
+            }
+            if ($ignoreExitCodes.Count -gt 0)
+            {
+                $params.Add('IgnoreExitCodes', $ignoreExitCodes)
+            }
+            Write-ADTLogEntry -Message "Installing $($adtSession.AppName) from $installFile (MSI)."
+            Start-ADTMsiProcess @params
+        }
+        '.exe'
+        {
+            $params = @{ FilePath = $installFilePath }
+            if ($arguments)
+            {
+                $params.Add('ArgumentList', $arguments)
+            }
+            if ($ignoreExitCodes.Count -gt 0)
+            {
+                $params.Add('IgnoreExitCodes', $ignoreExitCodes)
+            }
+            Write-ADTLogEntry -Message "Installing $($adtSession.AppName) from $installFile (EXE)."
+            Start-ADTProcess @params
+        }
+        default
+        {
+            throw "Unsupported setup file $installFile; supported are .msi and .exe."
+        }
     }
 }
 
-##------------------------------------------------
-## Uninstall-Application
-## Auto-detects uninstall method from config
-##------------------------------------------------
-Function Uninstall-Application {
+function Uninstall-Application
+{
+    <#
+    .SYNOPSIS
+        Uninstalls by product code, by an own uninstaller, or by the exact name in Programs and Features.
+    #>
     [CmdletBinding()]
-    param()
+    param
+    (
+    )
 
-    try {
-        Write-ADTLogEntry -Message "Starting Uninstall-Application" -Severity 1
+    $productCode = Get-PackageValue 'CheckMSIGuid'
+    $uninstaller = Get-PackageValue 'unInstallFileName'
+    $arguments = Get-PackageValue 'customUninstallParameter'
 
-        # Resolve display names (use Control Panel variants if specified)
-        [string]$appNameToSearch = if (-not [string]::IsNullOrWhiteSpace($adtSession.appNameControlPanel)) {
-            Write-ADTLogEntry -Message "Using Control Panel app name: $($adtSession.appNameControlPanel)"
-            $adtSession.appNameControlPanel
+    if ($uninstaller)
+    {
+        # Route 1: own uninstaller (full path, or relative to .\Files).
+        $path = if ([System.IO.Path]::IsPathRooted($uninstaller)) { $uninstaller } else { Join-Path -Path $adtSession.DirFiles -ChildPath $uninstaller }
+        Write-ADTLogEntry -Message "Uninstalling with $path."
+        $params = @{ FilePath = $path }
+        if ($arguments)
+        {
+            $params.Add('ArgumentList', $arguments)
         }
-        else {
-            Write-ADTLogEntry -Message "Using app name: $($adtSession.appName)"
-            $adtSession.appName
-        }
-
-        [string]$vendorToSearch = if (-not [string]::IsNullOrWhiteSpace($adtSession.appVendorControlPanel)) {
-            Write-ADTLogEntry -Message "Using Control Panel vendor: $($adtSession.appVendorControlPanel)"
-            $adtSession.appVendorControlPanel
-        }
-        else {
-            Write-ADTLogEntry -Message "Using vendor: $($adtSession.appVendor)"
-            $adtSession.appVendor
-        }
-
-        $splatParams = @{ Verbose = $true }
-
-        # Route 1: Custom EXE uninstaller
-        if (-not [string]::IsNullOrWhiteSpace($adtSession.unInstallFileName)) {
-            Write-ADTLogEntry -Message "Using custom EXE uninstaller: $($adtSession.unInstallFileName)"
-            $splatParams['ApplicationType'] = 'EXE'
-            $splatParams['FilterScript']    = { $_.DisplayName -like "*$appNameToSearch*" }.GetNewClosure()
-
-            if (-not [string]::IsNullOrWhiteSpace($adtSession.customUninstallParameter)) {
-                $splatParams['ArgumentList'] = $adtSession.customUninstallParameter
-            }
-        }
-        # Route 2: Auto-detect by name and/or vendor
-        else {
-            if (-not [string]::IsNullOrWhiteSpace($appNameToSearch) -and -not [string]::IsNullOrWhiteSpace($vendorToSearch)) {
-                $splatParams['FilterScript'] = {
-                    ($_.DisplayName -like "*$appNameToSearch*") -and ($_.Publisher -like "*$vendorToSearch*")
-                }.GetNewClosure()
-                Write-ADTLogEntry -Message "Auto-detecting by name '$appNameToSearch' AND vendor '$vendorToSearch'"
-            }
-            elseif (-not [string]::IsNullOrWhiteSpace($appNameToSearch)) {
-                $splatParams['Name'] = $appNameToSearch
-                Write-ADTLogEntry -Message "Auto-detecting by name: '$appNameToSearch'"
-            }
-            elseif (-not [string]::IsNullOrWhiteSpace($vendorToSearch)) {
-                $splatParams['FilterScript'] = { $_.Publisher -like "*$vendorToSearch*" }.GetNewClosure()
-                Write-ADTLogEntry -Message "Auto-detecting by vendor: '$vendorToSearch'"
-            }
-            else {
-                Write-ADTLogEntry -Message "Insufficient information for uninstallation." -Severity 3
-                throw "AppName and AppVendor are both empty — cannot auto-detect uninstaller"
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($adtSession.customUninstallParameter)) {
-                $splatParams['ArgumentList'] = $adtSession.customUninstallParameter
-            }
-        }
-
-        Uninstall-ADTApplication @splatParams
-        Write-ADTLogEntry -Message "Uninstallation completed successfully." -Severity 1
+        Start-ADTProcess @params
+        return
     }
-    catch {
-        Write-ADTLogEntry -Message "Uninstall-Application failed: $($_.Exception.Message)" -Severity 3
-        throw
+
+    if ($productCode)
+    {
+        # Route 2: MSI product code.
+        Write-ADTLogEntry -Message "Uninstalling product code $productCode."
+        Start-ADTMsiProcess -Action Uninstall -ProductCode $productCode
+        return
     }
+
+    # Route 3: by name. Exact when the Programs and Features name is set; otherwise the app name
+    # must match together with the publisher, and an ambiguous match stops instead of removing more.
+    $exactName = Get-PackageValue 'appNameControlPanel'
+    $publisher = Get-PackageValue 'appVendorControlPanel' $adtSession.AppVendor
+    $params = if ($exactName)
+    {
+        @{ Name = $exactName; NameMatch = 'Exact' }
+    }
+    else
+    {
+        @{ Name = $adtSession.AppName; NameMatch = 'Contains' }
+    }
+    if ($publisher)
+    {
+        $params.Add('FilterScript', { $_.Publisher -like "*$publisher*" }.GetNewClosure())
+    }
+
+    $found = @(Get-ADTApplication @params)
+    if ($found.Count -eq 0)
+    {
+        Write-ADTLogEntry -Message "Nothing to uninstall: no application matches '$($params.Name)'." -Severity 2
+        return
+    }
+    if ($found.Count -gt 1 -and !$exactName)
+    {
+        throw "'$($params.Name)' matches $($found.Count) applications ($(($found.DisplayName) -join ', ')). Set appNameControlPanel to the exact name."
+    }
+
+    Write-ADTLogEntry -Message "Uninstalling $(($found.DisplayName) -join ', ')."
+    if ($arguments)
+    {
+        $params.Add('ArgumentList', $arguments)
+    }
+    Uninstall-ADTApplication @params
 }
 
-##------------------------------------------------
-## Check-Application
-## 5-layer verification: Name → ControlPanel → Executable+Version → Registry → MSI GUID
-## Returns: 'Installed' | 'NotInstalled' | 'Error'
-##------------------------------------------------
-Function Check-Application {
+function Test-ApplicationState
+{
+    <#
+    .SYNOPSIS
+        Checks the application. Returns 'Installed', 'NotInstalled' or 'Error'.
+
+    .DESCRIPTION
+        Every configured check must pass:
+        1. MSI product code (CheckMSIGuid), or else the name in Programs and Features (exact when appNameControlPanel is set).
+        2. Main executable, optionally with a minimum version.
+        3. Registry key, optionally with value name and data.
+    #>
     [CmdletBinding()]
-    param()
+    param
+    (
+    )
 
-    try {
-        Write-ADTLogEntry -Message "======== Check-Application START ========" -Severity 1
-        Write-ADTLogEntry -Message "Target: $($adtSession.appName)" -Severity 1
-
-        # Layer 1: Application Name
-        Write-ADTLogEntry -Message "--- Layer 1: App Name Check ---" -Severity 1
-        if (-not (Get-ADTApplication -Name $adtSession.appName)) {
-            Write-ADTLogEntry -Message "NOT FOUND: '$($adtSession.appName)'" -Severity 2
-            return 'NotInstalled'
-        }
-        Write-ADTLogEntry -Message "FOUND: '$($adtSession.appName)'" -Severity 1
-
-        # Layer 2: Control Panel Name (optional)
-        if (-not [string]::IsNullOrWhiteSpace($adtSession.appNameControlPanel)) {
-            Write-ADTLogEntry -Message "--- Layer 2: Control Panel Name Check ---" -Severity 1
-            $cpApp = Get-ADTApplication -Name $adtSession.appNameControlPanel
-
-            if (-not $cpApp -or $cpApp.DisplayName -ne $adtSession.appNameControlPanel) {
-                Write-ADTLogEntry -Message "NOT FOUND: Control Panel name '$($adtSession.appNameControlPanel)'" -Severity 2
+    try
+    {
+        # 1. Product code, or the name.
+        if ($productCode = Get-PackageValue 'CheckMSIGuid')
+        {
+            if (!(Get-ADTApplication -ProductCode $productCode))
+            {
+                Write-ADTLogEntry -Message "Check: product code $productCode is not installed."
                 return 'NotInstalled'
             }
-            Write-ADTLogEntry -Message "FOUND: Control Panel name verified" -Severity 1
+            Write-ADTLogEntry -Message "Check: product code $productCode is installed."
         }
-
-        # Layer 3: Main Executable + Version (optional)
-        if (-not [string]::IsNullOrWhiteSpace($adtSession.mainExecutablePath)) {
-            Write-ADTLogEntry -Message "--- Layer 3: Executable Check ---" -Severity 1
-
-            if (-not (Test-Path -Path $adtSession.mainExecutablePath -PathType Leaf)) {
-                Write-ADTLogEntry -Message "NOT FOUND: '$($adtSession.mainExecutablePath)'" -Severity 2
+        else
+        {
+            $exactName = Get-PackageValue 'appNameControlPanel'
+            $found = if ($exactName)
+            {
+                Get-ADTApplication -Name $exactName -NameMatch Exact
+            }
+            else
+            {
+                Get-ADTApplication -Name $adtSession.AppName
+            }
+            if (!$found)
+            {
+                Write-ADTLogEntry -Message "Check: '$(if ($exactName) { $exactName } else { $adtSession.AppName })' is not in Programs and Features."
                 return 'NotInstalled'
             }
-            Write-ADTLogEntry -Message "FOUND: Executable exists" -Severity 1
+            Write-ADTLogEntry -Message "Check: found $((@($found).DisplayName) -join ', ')."
+        }
 
-            if (-not [string]::IsNullOrWhiteSpace($adtSession.appVersionCheck)) {
-                $versionInfo  = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($adtSession.mainExecutablePath)
-                $actualVersion = if ($adtSession.useFileVersion) { $versionInfo.FileVersion } else { $versionInfo.ProductVersion }
-
-                Write-ADTLogEntry -Message "FileVersion: '$($versionInfo.FileVersion)' | ProductVersion: '$($versionInfo.ProductVersion)'"
-                Write-ADTLogEntry -Message "Using: $(if ($adtSession.useFileVersion) { 'FileVersion' } else { 'ProductVersion' }) = '$actualVersion'"
-                Write-ADTLogEntry -Message "Expected: '$($adtSession.appVersionCheck)'"
-
-                if ($actualVersion -ne $adtSession.appVersionCheck) {
-                    Write-ADTLogEntry -Message "VERSION MISMATCH: found '$actualVersion', expected '$($adtSession.appVersionCheck)'" -Severity 2
-                    return 'NotInstalled'
+        # 2. Main executable and minimum version.
+        if ($exe = Get-PackageValue 'mainExecutablePath')
+        {
+            $exe = [System.Environment]::ExpandEnvironmentVariables($exe)
+            if (!(Test-Path -LiteralPath $exe -PathType Leaf))
+            {
+                Write-ADTLogEntry -Message "Check: $exe does not exist."
+                return 'NotInstalled'
+            }
+            if ($expected = Get-PackageValue 'appVersionCheck')
+            {
+                $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+                $actual = if (Get-PackageValue 'useFileVersion' $true)
+                {
+                    [System.Version]::new($info.FileMajorPart, $info.FileMinorPart, $info.FileBuildPart, $info.FilePrivatePart)
                 }
-                Write-ADTLogEntry -Message "Version check passed." -Severity 1
-            }
-        }
-
-        # Layer 4: Registry (optional)
-        if (-not [string]::IsNullOrWhiteSpace($adtSession.checkRegistryKey)) {
-            Write-ADTLogEntry -Message "--- Layer 4: Registry Check ---" -Severity 1
-
-            $hive = if (-not [string]::IsNullOrWhiteSpace($adtSession.checkRegistryHive)) { $adtSession.checkRegistryHive } else { 'HKLM' }
-            $fullRegPath = switch ($hive.ToUpper()) {
-                'HKLM' { "HKLM:\$($adtSession.checkRegistryKey)" }
-                'HKCU' { "HKCU:\$($adtSession.checkRegistryKey)" }
-                default {
-                    Write-ADTLogEntry -Message "Invalid registry hive: '$hive'. Use HKLM or HKCU." -Severity 3
+                else
+                {
+                    [System.Version]::new($info.ProductMajorPart, $info.ProductMinorPart, $info.ProductBuildPart, $info.ProductPrivatePart)
+                }
+                $minimum = $null
+                if (![System.Version]::TryParse($expected, [ref]$minimum))
+                {
+                    Write-ADTLogEntry -Message "Check: appVersionCheck '$expected' is not a version (e.g. 1.0.0.123)." -Severity 3
                     return 'Error'
                 }
+                if ($actual -lt $minimum)
+                {
+                    Write-ADTLogEntry -Message "Check: $exe has version $actual, at least $minimum is expected."
+                    return 'NotInstalled'
+                }
+                Write-ADTLogEntry -Message "Check: $exe has version $actual (at least $minimum)."
             }
+        }
 
-            if (-not (Test-Path -Path $fullRegPath -PathType Container)) {
-                Write-ADTLogEntry -Message "NOT FOUND: Registry key '$fullRegPath'" -Severity 2
+        # 3. Registry key, value name and data.
+        if ($key = Get-PackageValue 'checkRegistryKey')
+        {
+            $hive = ([System.String](Get-PackageValue 'checkRegistryHive' 'HKLM')).ToUpperInvariant()
+            if ($hive -notin 'HKLM', 'HKCU')
+            {
+                Write-ADTLogEntry -Message "Check: checkRegistryHive '$hive' must be HKLM or HKCU." -Severity 3
+                return 'Error'
+            }
+            $path = "${hive}:\$key"
+            if (!(Test-Path -LiteralPath $path -PathType Container))
+            {
+                Write-ADTLogEntry -Message "Check: registry key $path does not exist."
                 return 'NotInstalled'
             }
-            Write-ADTLogEntry -Message "FOUND: Registry key exists" -Severity 1
-
-            if (-not [string]::IsNullOrWhiteSpace($adtSession.checkRegistryValueName)) {
-                try {
-                    $regValue    = Get-ItemProperty -Path $fullRegPath -Name $adtSession.checkRegistryValueName -ErrorAction Stop
-                    $actualData  = $regValue.$($adtSession.checkRegistryValueName)
-                    Write-ADTLogEntry -Message "Value '$($adtSession.checkRegistryValueName)' = '$actualData'"
-
-                    if (-not [string]::IsNullOrWhiteSpace($adtSession.checkRegistryValueData)) {
-                        if ($actualData -ne $adtSession.checkRegistryValueData) {
-                            Write-ADTLogEntry -Message "VALUE MISMATCH: found '$actualData', expected '$($adtSession.checkRegistryValueData)'" -Severity 2
-                            return 'NotInstalled'
-                        }
-                        Write-ADTLogEntry -Message "Registry value data check passed." -Severity 1
-                    }
+            if ($valueName = Get-PackageValue 'checkRegistryValueName')
+            {
+                $value = Get-ItemProperty -LiteralPath $path -Name $valueName -ErrorAction Ignore
+                if ($null -eq $value)
+                {
+                    Write-ADTLogEntry -Message "Check: registry value $path\$valueName does not exist."
+                    return 'NotInstalled'
                 }
-                catch {
-                    Write-ADTLogEntry -Message "NOT FOUND: Registry value '$($adtSession.checkRegistryValueName)'" -Severity 2
+                $expectedData = Get-PackageValue 'checkRegistryValueData'
+                if ($null -ne $expectedData -and [System.String]$value.$valueName -ne [System.String]$expectedData)
+                {
+                    Write-ADTLogEntry -Message "Check: registry value $path\$valueName is '$($value.$valueName)', '$expectedData' is expected."
                     return 'NotInstalled'
                 }
             }
+            Write-ADTLogEntry -Message "Check: registry $path matches."
         }
 
-        # Layer 5: MSI GUID (optional)
-        if (-not [string]::IsNullOrWhiteSpace($adtSession.CheckMSIGuid)) {
-            Write-ADTLogEntry -Message "--- Layer 5: MSI GUID Check ---" -Severity 1
-            Write-ADTLogEntry -Message "GUID: '$($adtSession.CheckMSIGuid)'"
-
-            $msiProduct = Get-ADTApplication -ProductCode $adtSession.CheckMSIGuid
-            if (-not $msiProduct) {
-                Write-ADTLogEntry -Message "NOT FOUND: MSI GUID '$($adtSession.CheckMSIGuid)'" -Severity 2
-                return 'NotInstalled'
-            }
-            Write-ADTLogEntry -Message "FOUND: $($msiProduct.DisplayName)" -Severity 1
-        }
-
-        Write-ADTLogEntry -Message "======== Check-Application PASSED ========" -Severity 1
         return 'Installed'
     }
-    catch {
-        Write-ADTLogEntry -Message "Check-Application threw an exception: $($_.Exception.Message)" -Severity 3
+    catch
+    {
+        Write-ADTLogEntry -Message "The application check failed: $(Resolve-ADTErrorRecord -ErrorRecord $_)" -Severity 3
         return 'Error'
     }
 }
 
-##------------------------------------------------
-## Set-DeploymentInventoryRegPath
-## Ensures the base inventory registry path exists
-##------------------------------------------------
-Function Set-DeploymentInventoryRegPath {
+function Register-AppInstallation
+{
+    <#
+    .SYNOPSIS
+        Writes the inventory record after the installation (IsInstalled = 1).
+    #>
     [CmdletBinding()]
-    param()
+    param
+    (
+    )
 
-    try {
-        Set-ADTRegistryKey -Key $DeployInvRegPath
-        Write-ADTLogEntry -Message "Inventory registry path verified: $DeployInvRegPath" -Severity 1
+    $key = "$script:DeployInvRegPath\$($adtSession.InstallName)"
+    try
+    {
+        Set-ADTRegistryKey -LiteralPath $key -Name 'AppID' -Value ([System.String](Get-PackageValue 'PSADTAppID' '')) -Type String
+        Set-ADTRegistryKey -LiteralPath $key -Name 'AppName' -Value $adtSession.AppName -Type String
+        Set-ADTRegistryKey -LiteralPath $key -Name 'AppVendor' -Value $adtSession.AppVendor -Type String
+        Set-ADTRegistryKey -LiteralPath $key -Name 'AppVersion' -Value $adtSession.AppVersion -Type String
+        Set-ADTRegistryKey -LiteralPath $key -Name 'AppRevision' -Value $adtSession.AppRevision -Type String
+        Set-ADTRegistryKey -LiteralPath $key -Name 'Install Date' -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -Type String
+        Set-ADTRegistryKey -LiteralPath $key -Name 'Install ExitCode' -Value ([System.String]$adtSession.GetExitCode()) -Type String
+        Set-ADTRegistryKey -LiteralPath $key -Name 'IsInstalled' -Value '1' -Type String
+        Write-ADTLogEntry -Message "Inventory record written to $key."
     }
-    catch {
-        Write-ADTLogEntry -Message "Failed to create inventory registry path: $($_.Exception.Message)" -Severity 3
+    catch
+    {
+        Write-ADTLogEntry -Message "The inventory record could not be written to ${key}: $(Resolve-ADTErrorRecord -ErrorRecord $_)" -Severity 2
     }
 }
 
-##------------------------------------------------
-## Register-AppInstallation
-## Writes package metadata to inventory registry
-##------------------------------------------------
-Function Register-AppInstallation {
+function Unregister-Installation
+{
+    <#
+    .SYNOPSIS
+        Updates the inventory record after the uninstallation (IsInstalled = 0).
+    #>
     [CmdletBinding()]
-    param()
+    param
+    (
+    )
 
-    try {
-        $SIKey = "$DeployInvRegPath\$PSADTPackageName"
-        Write-ADTLogEntry -Message "Writing package metadata to registry: $SIKey"
-
-        Set-ADTRegistryKey -Key $SIKey -Name 'AppID'      -Value "$($adtSession.PSADTAppID)"  -Type String
-        Set-ADTRegistryKey -Key $SIKey -Name 'AppName'    -Value "$($adtSession.AppName)"     -Type String
-        Set-ADTRegistryKey -Key $SIKey -Name 'AppVendor'  -Value "$($adtSession.AppVendor)"   -Type String
-        Set-ADTRegistryKey -Key $SIKey -Name 'AppVersion' -Value "$($adtSession.AppVersion)"  -Type String
-        Set-ADTRegistryKey -Key $SIKey -Name 'AppRevision'-Value "$($adtSession.AppRevision)" -Type String
+    $key = "$script:DeployInvRegPath\$($adtSession.InstallName)"
+    try
+    {
+        Set-ADTRegistryKey -LiteralPath $key -Name 'Uninstall Date' -Value (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -Type String
+        Set-ADTRegistryKey -LiteralPath $key -Name 'Uninstall ExitCode' -Value ([System.String]$adtSession.GetExitCode()) -Type String
+        Set-ADTRegistryKey -LiteralPath $key -Name 'IsInstalled' -Value '0' -Type String
+        Write-ADTLogEntry -Message "Inventory record updated in $key."
     }
-    catch {
-        Write-ADTLogEntry -Message "Register-AppInstallation failed: $($_.Exception.Message)" -Severity 3
-    }
-}
-
-##------------------------------------------------
-## Register-SuccessOfAppInstallation
-## Writes install timestamp and exit code to registry
-##------------------------------------------------
-Function Register-SuccessOfAppInstallation {
-    [CmdletBinding()]
-    param()
-
-    try {
-        $SIKey          = "$DeployInvRegPath\$PSADTPackageName"
-        $installDate    = (Get-Date -Format 'dd.MM.yyyy HH:mm')
-        $currentExitCode = if ($adtSession.ExitCode) { $adtSession.ExitCode } else { '0' }
-
-        Set-ADTRegistryKey -Key $SIKey -Name 'Install Date'     -Value "$installDate"     -Type String
-        Set-ADTRegistryKey -Key $SIKey -Name 'Install ExitCode' -Value "$currentExitCode" -Type String
-        Set-ADTRegistryKey -Key $SIKey -Name 'IsInstalled'      -Value '1'                -Type String
-
-        Write-ADTLogEntry -Message "Installation registered: $PSADTPackageName at $installDate" -Severity 1
-    }
-    catch {
-        Write-ADTLogEntry -Message "Register-SuccessOfAppInstallation failed: $($_.Exception.Message)" -Severity 3
-    }
-}
-
-##------------------------------------------------
-## Unregister-Installation
-## Updates inventory registry on uninstall
-##------------------------------------------------
-Function Unregister-Installation {
-    [CmdletBinding()]
-    param()
-
-    try {
-        $SIKey           = "$DeployInvRegPath\$PSADTPackageName"
-        $uninstallDate   = (Get-Date -Format 'dd.MM.yyyy HH:mm')
-        $currentExitCode = if ($adtSession.ExitCode) { $adtSession.ExitCode } else { '0' }
-
-        Set-ADTRegistryKey -Key $SIKey -Name 'Uninstall Date'     -Value "$uninstallDate"   -Type String
-        Set-ADTRegistryKey -Key $SIKey -Name 'Uninstall ExitCode' -Value "$currentExitCode" -Type String
-        Set-ADTRegistryKey -Key $SIKey -Name 'IsInstalled'        -Value '0'                -Type String
-
-        Write-ADTLogEntry -Message "Uninstallation registered: $PSADTPackageName at $uninstallDate" -Severity 1
-    }
-    catch {
-        Write-ADTLogEntry -Message "Unregister-Installation failed: $($_.Exception.Message)" -Severity 3
+    catch
+    {
+        Write-ADTLogEntry -Message "The inventory record could not be updated in ${key}: $(Resolve-ADTErrorRecord -ErrorRecord $_)" -Severity 2
     }
 }
 
@@ -669,33 +740,29 @@ Function Unregister-Installation {
 ## MARK: Initialization
 ##================================================
 
+# Set strict error handling across entire operation.
 $ErrorActionPreference = [System.Management.Automation.ActionPreference]::Stop
-$ProgressPreference    = [System.Management.Automation.ActionPreference]::SilentlyContinue
+$ProgressPreference = [System.Management.Automation.ActionPreference]::SilentlyContinue
 Set-StrictMode -Version 1
 
+# Import the module and instantiate a new session.
 try
 {
+    # Import the module locally if available, otherwise try to find it from PSModulePath.
     if (Test-Path -LiteralPath "$PSScriptRoot\PSAppDeployToolkit\PSAppDeployToolkit.psd1" -PathType Leaf)
     {
         Get-ChildItem -LiteralPath "$PSScriptRoot\PSAppDeployToolkit" -Recurse -File | Unblock-File -ErrorAction Ignore
-        Import-Module -FullyQualifiedName @{
-            ModuleName    = "$PSScriptRoot\PSAppDeployToolkit\PSAppDeployToolkit.psd1"
-            Guid          = '8c3c366b-8606-4576-9f2d-4051144f7ca2'
-            ModuleVersion = '4.1.7'
-        } -Force
+        Import-Module -FullyQualifiedName @{ ModuleName = "$PSScriptRoot\PSAppDeployToolkit\PSAppDeployToolkit.psd1"; Guid = '8c3c366b-8606-4576-9f2d-4051144f7ca2'; ModuleVersion = '4.1.8' } -Force
     }
     else
     {
-        Import-Module -FullyQualifiedName @{
-            ModuleName    = 'PSAppDeployToolkit'
-            Guid          = '8c3c366b-8606-4576-9f2d-4051144f7ca2'
-            ModuleVersion = '4.1.7'
-        } -Force
+        Import-Module -FullyQualifiedName @{ ModuleName = 'PSAppDeployToolkit'; Guid = '8c3c366b-8606-4576-9f2d-4051144f7ca2'; ModuleVersion = '4.1.8' } -Force
     }
 
-    $iadtParams  = Get-ADTBoundParametersAndDefaultValues -Invocation $MyInvocation
-    $adtSession  = Remove-ADTHashtableNullOrEmptyValues -Hashtable $adtSession
-    $adtSession  = Open-ADTSession @adtSession @iadtParams -PassThru
+    # Open a new deployment session, replacing $adtSession with a DeploymentSession.
+    $iadtParams = Get-ADTBoundParametersAndDefaultValues -Invocation $MyInvocation
+    $adtSession = Remove-ADTHashtableNullOrEmptyValues -Hashtable $adtSession
+    $adtSession = Open-ADTSession @adtSession @iadtParams -PassThru
 }
 catch
 {
@@ -708,9 +775,10 @@ catch
 ## MARK: Invocation
 ##================================================
 
+# Commence the actual deployment operation.
 try
 {
-    # Load any PSADT extensions found in subdirectories
+    # Import any found extensions before proceeding with the deployment.
     Get-ChildItem -LiteralPath $PSScriptRoot -Directory | & {
         process
         {
@@ -722,12 +790,14 @@ try
         }
     }
 
+    # Invoke the deployment and close out the session.
     & "$($adtSession.DeploymentType)-ADTDeployment"
     Close-ADTSession
 }
 catch
 {
-    $mainErrorMessage = "Unhandled error in [$($MyInvocation.MyCommand.Name)].`n$(Resolve-ADTErrorRecord -ErrorRecord $_)"
+    # An unhandled error has been caught.
+    $mainErrorMessage = "An unhandled error within [$($MyInvocation.MyCommand.Name)] has occurred.`n$(Resolve-ADTErrorRecord -ErrorRecord $_)"
     Write-ADTLogEntry -Message $mainErrorMessage -Severity 3
     Close-ADTSession -ExitCode 60001
 }
